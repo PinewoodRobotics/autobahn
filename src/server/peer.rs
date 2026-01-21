@@ -204,3 +204,130 @@ impl Peer {
     return true;
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::message::{MessageType, ServerStateMessage};
+  use crate::util::proto::build_proto_message;
+  use bytes::Bytes;
+  use futures_util::{SinkExt, StreamExt};
+  use tokio::sync::mpsc;
+
+  async fn spawn_peer_ws_server(
+    uuid: &str,
+    topics: Vec<String>,
+  ) -> (Address, mpsc::UnboundedReceiver<Bytes>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = Address::new("127.0.0.1".to_string(), port as i32);
+
+    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+    let uuid = uuid.to_string();
+
+    tokio::spawn(async move {
+      let (stream, _) = listener.accept().await.unwrap();
+      let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+      let (mut write, mut read) = ws_stream.split();
+
+      let server_state = build_proto_message(&ServerStateMessage {
+        message_type: MessageType::ServerState as i32,
+        uuid,
+        topics,
+      });
+      let _ = write
+        .send(tungstenite::Message::Binary(server_state))
+        .await;
+
+      while let Some(Ok(msg)) = read.next().await {
+        let _ = tx.send(Bytes::from(msg.into_data()));
+      }
+    });
+
+    (addr, rx)
+  }
+
+  fn free_unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port()
+  }
+
+  #[tokio::test]
+  async fn test_ensure_connection_sets_id_topics_and_resets_attempts() {
+    let (addr, _rx) = spawn_peer_ws_server("peer-1", vec!["t".to_string()]).await;
+    let mut peer = Peer::new(addr);
+
+    // Force attempts > 0
+    peer.connection_attempts = 3;
+
+    assert!(peer.ensure_connection().await);
+    assert!(peer.is_connected());
+    assert_eq!(peer.server_id(), Some("peer-1".to_string()));
+    assert!(peer.contains_topic(&"t".to_string()));
+    assert_eq!(peer.get_connection_attempts(), 0);
+
+    // Second call should be fast and not change attempts.
+    assert!(peer.ensure_connection().await);
+    assert_eq!(peer.get_connection_attempts(), 0);
+  }
+
+  #[tokio::test]
+  async fn test_send_raw_sends_bytes_to_peer() {
+    let (addr, mut rx) = spawn_peer_ws_server("peer-2", vec![]).await;
+    let mut peer = Peer::new(addr);
+    assert!(peer.ensure_connection().await);
+
+    let payload = Bytes::from_static(b"hello");
+    assert!(peer.send_raw(payload.clone()).await);
+
+    let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(got, payload);
+  }
+
+  #[tokio::test]
+  async fn test_send_raw_to_unreachable_peer_returns_false() {
+    let port = free_unused_port();
+    let addr = Address::from_str(&format!("127.0.0.1:{}", port)).unwrap();
+    let mut peer = Peer::new(addr);
+
+    let payload = Bytes::from_static(b"x");
+    let res = tokio::time::timeout(std::time::Duration::from_secs(2), peer.send_raw(payload))
+      .await
+      .unwrap();
+    assert!(!res);
+    assert!(!peer.is_connected());
+    assert!(peer.get_connection_attempts() >= 1);
+  }
+
+  #[tokio::test]
+  async fn test_close_websock_disconnects() {
+    let (addr, _rx) = spawn_peer_ws_server("peer-3", vec![]).await;
+    let mut peer = Peer::new(addr);
+    assert!(peer.ensure_connection().await);
+    assert!(peer.is_connected());
+
+    peer.close_websock().await;
+    assert!(!peer.is_connected());
+  }
+
+  #[tokio::test]
+  async fn test_update_topics_replaces_set() {
+    let port = free_unused_port();
+    let addr = Address::from_str(&format!("127.0.0.1:{}", port)).unwrap();
+    let mut peer = Peer::new(addr);
+
+    peer.update_topics(vec!["a".to_string(), "b".to_string()]);
+    assert!(peer.contains_topic(&"a".to_string()));
+    assert!(peer.contains_topic(&"b".to_string()));
+
+    peer.update_topics(vec!["c".to_string()]);
+    assert!(!peer.contains_topic(&"a".to_string()));
+    assert!(peer.contains_topic(&"c".to_string()));
+  }
+}

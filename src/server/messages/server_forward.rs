@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures_util::SinkExt;
 use log::debug;
 use prost::Message;
 
 use crate::{
   message::{
-    AbstractMessage, MessageType, PublishMessage, ServerForwardMessage, ServerStateMessage,
+    AbstractMessage, MessageType, PublishMessage, ServerForwardMessage,
   },
-  server::{peer::Peer, Server},
+  server::Server,
 };
 
 impl Server {
@@ -37,5 +36,92 @@ impl Server {
       }
       _ => {}
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    message::{MessageType, PublishMessage, TopicMessage},
+    server::topics_map::Websock,
+    util::{proto::build_proto_message, Address},
+  };
+  use futures_util::StreamExt;
+  use tokio::net::TcpListener;
+  use tokio::sync::mpsc;
+  use tokio_tungstenite::tungstenite;
+
+  async fn create_ws_with_receiver() -> (Arc<Websock>, mpsc::UnboundedReceiver<tungstenite::Message>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::unbounded_channel::<tungstenite::Message>();
+
+    tokio::spawn(async move {
+      let (socket, _) = listener.accept().await.unwrap();
+      let ws_stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+      let (_write, mut read) = ws_stream.split();
+      while let Some(Ok(msg)) = read.next().await {
+        let _ = tx.send(msg);
+      }
+    });
+
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let ws_stream = tokio_tungstenite::client_async("ws://localhost", socket)
+      .await
+      .unwrap()
+      .0;
+    let (write, _read) = ws_stream.split();
+    (Arc::new(Websock::new(write)), rx)
+  }
+
+  #[tokio::test]
+  async fn test_handle_server_forward_publish_delivers_to_local_subscribers() {
+    let server = Server::new(Vec::new(), Address::from_str("127.0.0.1:0").unwrap());
+    let (ws, mut rx) = create_ws_with_receiver().await;
+    server.topics_map.push("t".to_string(), ws).await;
+
+    let publish = PublishMessage {
+      message_type: MessageType::Publish as i32,
+      topic: "t".to_string(),
+      payload: b"fwd".to_vec(),
+    };
+    let publish_bytes = build_proto_message(&publish);
+    let fwd = ServerForwardMessage {
+      message_type: MessageType::ServerForward as i32,
+      payload: publish_bytes.to_vec(),
+    };
+
+    server.clone().handle_server_forward(fwd).await;
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    let tungstenite::Message::Binary(bin) = msg else {
+      panic!("expected binary publish");
+    };
+    let decoded = PublishMessage::decode(Bytes::from(bin)).unwrap();
+    assert_eq!(decoded.payload, b"fwd");
+  }
+
+  #[tokio::test]
+  async fn test_handle_server_forward_non_publish_is_ignored() {
+    let server = Server::new(Vec::new(), Address::from_str("127.0.0.1:0").unwrap());
+    let (ws, mut rx) = create_ws_with_receiver().await;
+    server.topics_map.push("t".to_string(), ws).await;
+
+    let sub = build_proto_message(&TopicMessage {
+      message_type: MessageType::Subscribe as i32,
+      topic: "t".to_string(),
+    });
+    let fwd = ServerForwardMessage {
+      message_type: MessageType::ServerForward as i32,
+      payload: sub.to_vec(),
+    };
+    server.clone().handle_server_forward(fwd).await;
+
+    let res = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+    assert!(res.is_err());
   }
 }

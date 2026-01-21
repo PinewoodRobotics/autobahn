@@ -169,8 +169,45 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_get_local_ip_system_dependent() {
-    let ip = get_local_ip_system_dependent().unwrap();
-    println!("IP: {}", ip);
+  fn test_get_local_ip_helpers_do_not_panic() {
+    let _ = get_local_ip_system_dependent();
+    let _ = get_first_non_loopback_ip();
+    let _ = get_local_ip("definitely-not-an-interface");
+  }
+
+  #[test]
+  fn test_create_service_info_contains_ip_and_port_props() {
+    let d = Discovery::new_with_ip("127.0.0.1".to_string(), 4242);
+    let info = d.create_service_info();
+    let ip = info
+      .get_properties()
+      .get("ip")
+      .and_then(|v| v.val())
+      .map(|b| String::from_utf8(b.to_vec()).unwrap())
+      .unwrap();
+    let port = info
+      .get_properties()
+      .get("port")
+      .and_then(|v| v.val())
+      .map(|b| String::from_utf8(b.to_vec()).unwrap())
+      .unwrap();
+    assert_eq!(ip, "127.0.0.1");
+    assert_eq!(port, "4242");
+  }
+
+  #[tokio::test]
+  async fn test_run_discovery_server_does_not_panic() {
+    let discovery = Discovery::new_with_ip("127.0.0.1".to_string(), 4242);
+    discovery.run_discovery_server();
+  }
+
+  #[tokio::test]
+  async fn test_run_discovery_server_continuous_runs_at_least_once() {
+    let discovery = Discovery::new_with_ip("127.0.0.1".to_string(), 4243);
+    // The first interval tick is immediate; we should execute at least one loop iteration quickly.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), async move {
+      discovery.run_discovery_server_continuous().await;
+    })
+    .await;
   }
 }

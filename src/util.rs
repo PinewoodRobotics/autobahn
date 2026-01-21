@@ -54,4 +54,19 @@ mod tests {
     assert_eq!(addr.host, "127.0.0.1");
     assert_eq!(addr.port, 8080);
   }
+
+  #[test]
+  fn test_address_from_str_invalid() {
+    assert!(Address::from_str("127.0.0.1").is_err());
+    assert!(Address::from_str("127.0.0.1:abc").is_err());
+    assert!(Address::from_str("a:b:c").is_err());
+  }
+
+  #[test]
+  fn test_address_build_ws_url_and_to_string_and_display() {
+    let addr = Address::new("localhost".to_string(), 1234);
+    assert_eq!(addr.build_ws_url(), "ws://localhost:1234");
+    assert_eq!(addr.to_string(), "localhost:1234");
+    assert_eq!(format!("{}", addr), "localhost:1234");
+  }
 }

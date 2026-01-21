@@ -209,7 +209,10 @@ mod tests {
   use super::*;
   use futures::StreamExt;
 
+  use futures_util::SinkExt;
   use tokio::net::TcpListener;
+  use tokio::sync::{mpsc, oneshot};
+  use tokio_tungstenite::tungstenite;
 
   async fn create_mock_websocket() -> Arc<Websock> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -239,6 +242,45 @@ mod tests {
     accept_task.await.unwrap();
 
     client_ws
+  }
+
+  async fn create_mock_websocket_with_receiver(
+  ) -> (Arc<Websock>, mpsc::UnboundedReceiver<tungstenite::Message>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = mpsc::unbounded_channel::<tungstenite::Message>();
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+
+    // Accept side reads whatever the returned Websock sends.
+    tokio::spawn(async move {
+      let (socket, _) = listener.accept().await.unwrap();
+      let ws_stream = tokio_tungstenite::accept_async(socket).await.unwrap();
+      let (_write, mut read) = ws_stream.split();
+      let _ = ready_tx.send(());
+
+      while let Some(Ok(msg)) = read.next().await {
+        let _ = tx.send(msg);
+      }
+    });
+
+    // Connect side: we return the *write* half wrapped in Websock.
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let ws_stream = tokio_tungstenite::client_async("ws://localhost", socket)
+      .await
+      .unwrap()
+      .0;
+    let (write, _read) = ws_stream.split();
+    let client_ws = Arc::new(Websock::new(write));
+
+    let _ = ready_rx.await;
+    (client_ws, rx)
+  }
+
+  async fn create_mock_websocket_with_closed_sink() -> Arc<Websock> {
+    let ws = create_mock_websocket().await;
+    let _ = ws.ws.write().await.close().await;
+    ws
   }
 
   #[tokio::test]
@@ -314,5 +356,115 @@ mod tests {
 
     assert!(!map.topic_map.read().await.contains_key("topic1"));
     assert!(map.topic_map.read().await.contains_key("topic2"));
+  }
+
+  #[tokio::test]
+  async fn test_send_to_topic_prunes_failed_subscriber_but_keeps_working_ones() {
+    let map = TopicsMap::new();
+    let (ws_ok, mut rx_ok) = create_mock_websocket_with_receiver().await;
+    let ws_bad = create_mock_websocket_with_closed_sink().await;
+
+    map.push("topic".to_string(), ws_ok.clone()).await;
+    map.push("topic".to_string(), ws_bad.clone()).await;
+
+    map
+      .send_to_topic("topic", tungstenite::Message::Binary(vec![1, 2, 3].into()))
+      .await;
+
+    // Working subscriber should still receive the message.
+    let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx_ok.recv())
+      .await
+      .unwrap();
+    assert!(matches!(received, Some(tungstenite::Message::Binary(_))));
+
+    // Failed subscriber should be pruned.
+    let topic_map = map.topic_map.read().await;
+    let subs = topic_map.get("topic").unwrap().read().await;
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].ws_id.as_str(), ws_ok.ws_id.as_str());
+  }
+
+  #[tokio::test]
+  async fn test_send_to_topic_removes_topic_if_last_subscriber_fails() {
+    let map = TopicsMap::new();
+    let ws_bad = create_mock_websocket_with_closed_sink().await;
+
+    map.push("topic".to_string(), ws_bad.clone()).await;
+
+    map
+      .send_to_topic("topic", tungstenite::Message::Binary(vec![9, 9, 9].into()))
+      .await;
+
+    assert!(!map.topic_map.read().await.contains_key("topic"));
+  }
+
+  #[tokio::test]
+  async fn test_send_to_topic_does_not_wedge_unsubscribe_paths() {
+    let map = TopicsMap::new();
+    let ws_bad = create_mock_websocket_with_closed_sink().await;
+    map.push("topic".to_string(), ws_bad.clone()).await;
+
+    // If send_to_topic held locks across socket I/O, this join could deadlock/hang.
+    let remove_fut = tokio::time::timeout(
+      std::time::Duration::from_millis(250),
+      map.remove_subscriber_from_topic("topic", &ws_bad),
+    );
+    let send_fut = tokio::time::timeout(
+      std::time::Duration::from_secs(3),
+      map.send_to_topic("topic", tungstenite::Message::Binary(vec![7].into())),
+    );
+
+    let (remove_res, send_res) = tokio::join!(remove_fut, send_fut);
+    remove_res.expect("remove_subscriber_from_topic should not be blocked by send_to_topic");
+    send_res.expect("send_to_topic should not hang indefinitely");
+  }
+
+  #[tokio::test]
+  async fn test_send_to_topic_unknown_topic_is_noop() {
+    let map = TopicsMap::new();
+    tokio::time::timeout(
+      std::time::Duration::from_millis(200),
+      map.send_to_topic("does-not-exist", tungstenite::Message::Binary(vec![1].into())),
+    )
+    .await
+    .expect("send_to_topic should return quickly for missing topic");
+  }
+
+  #[tokio::test]
+  async fn test_send_to_topic_timeout_prunes_locked_subscriber() {
+    let map = TopicsMap::new();
+    let (ws_ok, mut rx_ok) = create_mock_websocket_with_receiver().await;
+    let (ws_slow, mut rx_slow) = create_mock_websocket_with_receiver().await;
+
+    map.push("topic".to_string(), ws_ok.clone()).await;
+    map.push("topic".to_string(), ws_slow.clone()).await;
+
+    let (locked_tx, locked_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+      let _guard = ws_slow.ws.write().await;
+      let _ = locked_tx.send(());
+      tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    });
+    let _ = locked_rx.await;
+
+    map
+      .send_to_topic("topic", tungstenite::Message::Binary(vec![4, 5, 6].into()))
+      .await;
+
+    // Fast subscriber should receive the message.
+    let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx_ok.recv())
+      .await
+      .unwrap();
+    assert!(matches!(received, Some(tungstenite::Message::Binary(_))));
+
+    // Slow subscriber should be pruned (send timed out on acquiring write lock / sending).
+    let topic_map = map.topic_map.read().await;
+    let subs = topic_map.get("topic").unwrap().read().await;
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].ws_id.as_str(), ws_ok.ws_id.as_str());
+
+    // And the slow receiver should not see anything.
+    let slow_res = tokio::time::timeout(std::time::Duration::from_millis(200), rx_slow.recv()).await;
+    assert!(slow_res.is_err());
   }
 }

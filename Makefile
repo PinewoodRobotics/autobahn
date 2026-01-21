@@ -28,3 +28,30 @@ hard-reset:
 
 run-4mb-test:
 	$(PYTHONPATH) -m tests.calc_stats
+
+.PHONY: test coverage coverage-html
+
+test:
+	cargo test
+
+# Test coverage (% lines/regions) via cargo-llvm-cov.
+# One-time setup:
+#   cargo install cargo-llvm-cov
+#   rustup component add llvm-tools-preview
+coverage:
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
+		echo "Missing cargo-llvm-cov. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		echo "  rustup component add llvm-tools-preview"; \
+		exit 1; \
+	}
+	cargo llvm-cov --workspace --summary-only --ignore-filename-regex "src/main\\.rs$$" --fail-under-lines 90
+
+coverage-html:
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
+		echo "Missing cargo-llvm-cov. Install with:"; \
+		echo "  cargo install cargo-llvm-cov"; \
+		echo "  rustup component add llvm-tools-preview"; \
+		exit 1; \
+	}
+	cargo llvm-cov --workspace --html --ignore-filename-regex "src/main\\.rs$$"

@@ -163,3 +163,155 @@ impl PeersMap {
     peers.len()
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    message::{MessageType, ServerStateMessage},
+    util::proto::build_proto_message,
+  };
+  use bytes::Bytes;
+  use futures_util::{SinkExt, StreamExt};
+  use tokio::sync::mpsc;
+
+  async fn spawn_peer_ws_server(
+    uuid: &str,
+    topics: Vec<String>,
+  ) -> (Address, mpsc::UnboundedReceiver<Bytes>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let addr = Address::new("127.0.0.1".to_string(), port as i32);
+
+    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+    let uuid = uuid.to_string();
+
+    tokio::spawn(async move {
+      let (stream, _) = listener.accept().await.unwrap();
+      let ws_stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+      let (mut write, mut read) = ws_stream.split();
+
+      let server_state = build_proto_message(&ServerStateMessage {
+        message_type: MessageType::ServerState as i32,
+        uuid,
+        topics,
+      });
+      let _ = write
+        .send(tungstenite::Message::Binary(server_state))
+        .await;
+
+      while let Some(Ok(msg)) = read.next().await {
+        let _ = tx.send(Bytes::from(msg.into_data()));
+      }
+    });
+
+    (addr, rx)
+  }
+
+  fn free_unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+      .unwrap()
+      .local_addr()
+      .unwrap()
+      .port()
+  }
+
+  #[tokio::test]
+  async fn test_add_peer_deduplicates_by_address() {
+    let peers = PeersMap::new();
+    let addr = Address::from_str("127.0.0.1:12345").unwrap();
+    assert!(peers.add_peer(Peer::new(addr.clone())).await);
+    assert!(!peers.add_peer(Peer::new(addr)).await);
+    assert_eq!(peers.len().await, 1);
+  }
+
+  #[tokio::test]
+  async fn test_ensure_connections_sets_peer_id_and_topics() {
+    let (addr, _rx) = spawn_peer_ws_server("peer-1", vec!["t1".to_string()]).await;
+    let peers = PeersMap::new();
+    peers.add_peer(Peer::new(addr)).await;
+
+    let failed = peers.ensure_connections().await;
+    assert!(failed.is_empty());
+    assert!(peers.contains_peer("peer-1").await);
+
+    let peer_arc = peers.get_by_id("peer-1").await.expect("peer-1 missing");
+    let peer_r = peer_arc.read().await;
+    assert!(peer_r.contains_topic(&"t1".to_string()));
+  }
+
+  #[tokio::test]
+  async fn test_send_to_peers_filters_by_topic_interest() {
+    let (addr_a, mut rx_a) = spawn_peer_ws_server("peer-a", vec!["a".to_string()]).await;
+    let (addr_b, mut rx_b) = spawn_peer_ws_server("peer-b", vec!["b".to_string()]).await;
+
+    let peers = PeersMap::new();
+    peers.add_peer(Peer::new(addr_a)).await;
+    peers.add_peer(Peer::new(addr_b)).await;
+
+    let failed = peers.ensure_connections().await;
+    assert!(failed.is_empty());
+
+    let payload = Bytes::from_static(b"hello");
+    peers.send_to_peers("a", payload.clone()).await;
+
+    let got_a = tokio::time::timeout(std::time::Duration::from_secs(2), rx_a.recv())
+      .await
+      .unwrap();
+    assert_eq!(got_a.unwrap(), payload);
+
+    let got_b = tokio::time::timeout(std::time::Duration::from_millis(200), rx_b.recv()).await;
+    assert!(got_b.is_err(), "peer-b should not receive topic a payload");
+  }
+
+  #[tokio::test]
+  async fn test_update_peers_self_state_sends_to_all_peers() {
+    let (addr_a, mut rx_a) = spawn_peer_ws_server("peer-a2", vec![]).await;
+    let (addr_b, mut rx_b) = spawn_peer_ws_server("peer-b2", vec![]).await;
+
+    let peers = PeersMap::new();
+    peers.add_peer(Peer::new(addr_a)).await;
+    peers.add_peer(Peer::new(addr_b)).await;
+    let failed = peers.ensure_connections().await;
+    assert!(failed.is_empty());
+
+    let msg = build_proto_message(&ServerStateMessage {
+      message_type: MessageType::ServerState as i32,
+      uuid: "self".to_string(),
+      topics: vec!["x".to_string()],
+    });
+    peers.update_peers_self_state(msg.clone()).await;
+
+    let got_a = tokio::time::timeout(std::time::Duration::from_secs(2), rx_a.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    let got_b = tokio::time::timeout(std::time::Duration::from_secs(2), rx_b.recv())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(got_a, msg);
+    assert_eq!(got_b, msg);
+  }
+
+  #[tokio::test]
+  async fn test_check_connection_attempts_and_remove_drops_failing_peers() {
+    let port = free_unused_port();
+    let addr = Address::from_str(&format!("127.0.0.1:{}", port)).unwrap();
+    let mut peer = Peer::new(addr);
+
+    // Connection should fail quickly (no listener); attempts should increase.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), peer.ensure_connection())
+      .await
+      .unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), peer.ensure_connection())
+      .await
+      .unwrap();
+    assert!(peer.get_connection_attempts() >= 2);
+
+    let peers = PeersMap::new();
+    peers.add_peer(peer).await;
+    peers.check_connection_attempts_and_remove(1).await;
+    assert_eq!(peers.len().await, 0);
+  }
+}
