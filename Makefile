@@ -1,7 +1,7 @@
 mac-deps:
 	brew install sshpass
 
-UBUNTU_TARGET = tripli.local agathaking.local
+UBUNTU_TARGET = tynan.local
 SSH_PASSWORD = ubuntu
 PYTHONPATH = ./.venv/bin/python
 PATH_TO_PROJECT = /opt/blitz/autobahn/

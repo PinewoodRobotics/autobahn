@@ -143,8 +143,14 @@ impl Server {
             .await;
           None
         }
-        Ok(tungstenite::Message::Ping(_)) => {
-          debug!("Received ping message");
+        Ok(tungstenite::Message::Ping(payload)) => {
+          // Reply with Pong so intermediaries/clients don't consider us dead.
+          let _ = ws_write
+            .ws
+            .write()
+            .await
+            .send(tungstenite::Message::Pong(payload))
+            .await;
           None
         }
         Ok(msg) => Some(msg),

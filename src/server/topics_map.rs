@@ -1,12 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+  collections::{HashMap, HashSet},
+  sync::Arc,
+  time::Duration,
+};
 
 use bytes::Bytes;
 use futures_util::stream::SplitSink;
 use futures_util::SinkExt;
-use tokio::{
-  net::TcpStream,
-  sync::{Mutex, RwLock},
-};
+use tokio::{net::TcpStream, sync::RwLock};
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
@@ -70,22 +71,63 @@ impl TopicsMap {
   }
 
   pub async fn send_to_topic(&self, topic: &str, message: tungstenite::Message) {
-    let topic_map = self.topic_map.read().await;
-    let subscribers = topic_map.get(topic);
-    if subscribers.is_none() {
+    // IMPORTANT: never hold any TopicsMap locks across `.await`ing on socket I/O.
+    // If one subscriber blocks on send (slow client / dead connection), holding a lock here can:
+    // - stall all publishes to this topic
+    // - prevent subscribe/unsubscribe cleanup (reconnect appears "broken")
+    let subscribers_snapshot: Vec<Arc<Websock>> = {
+      let topic_map = self.topic_map.read().await;
+      let Some(subscribers) = topic_map.get(topic) else {
+        return;
+      };
+      // Ensure the subscribers read-guard is dropped before `topic_map`.
+      let snapshot = {
+        let subs_guard = subscribers.read().await;
+        subs_guard.clone()
+      };
+      snapshot
+    };
+
+    if subscribers_snapshot.is_empty() {
       return;
     }
 
-    let subscribers = subscribers.unwrap().read().await;
-
-    let futures = subscribers.iter().map(|ws| {
+    let send_futures = subscribers_snapshot.iter().map(|ws| {
       let message = message.clone();
       async move {
-        let _ = ws.ws.write().await.send(message).await;
+        // Bound send time so a single stuck subscriber can't wedge the topic indefinitely.
+        match tokio::time::timeout(Duration::from_secs(2), async {
+          ws.ws.write().await.send(message).await
+        })
+        .await
+        {
+          Ok(Ok(())) => None,
+          _ => Some(ws.ws_id.clone()),
+        }
       }
     });
 
-    futures_util::future::join_all(futures).await;
+    let failed_ids: HashSet<String> = futures_util::future::join_all(send_futures)
+      .await
+      .into_iter()
+      .flatten()
+      .collect();
+
+    if failed_ids.is_empty() {
+      return;
+    }
+
+    // Prune dead/stuck subscribers for this topic.
+    let topic_map = self.topic_map.read().await;
+    if let Some(subscribers) = topic_map.get(topic) {
+      subscribers
+        .write()
+        .await
+        .retain(|w| !failed_ids.contains(&w.ws_id));
+    }
+    drop(topic_map);
+
+    self.remove_unused_topics().await;
   }
 
   pub async fn get_all_topics(&self) -> Vec<String> {
@@ -102,6 +144,11 @@ impl TopicsMap {
         .write()
         .await
         .insert(topic.clone(), RwLock::new(Vec::new()));
+    }
+
+    if !self.topic_map.read().await.contains_key(&topic) {
+      // todo: verify this logic and see if its correctly done.
+      return;
     }
 
     self
